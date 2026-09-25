@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, relative } from "node:path";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
@@ -45,42 +45,32 @@ function inputHasAudio(inputUrl) {
   });
 }
 
-async function runFfmpeg(inputUrl, outputDirectory, job) {
-  const hasAudio = await inputHasAudio(inputUrl);
-  const maps = hasAudio
-    ? ["-map", "[v360out]", "-map", "0:a:0", "-map", "[v720out]", "-map", "0:a:0", "-map", "[v1080out]", "-map", "0:a:0"]
-    : ["-map", "[v360out]", "-map", "[v720out]", "-map", "[v1080out]"];
-  const audio = hasAudio
-    ? ["-c:a", "aac", "-ar", "48000", "-b:a:0", "96k", "-b:a:1", "128k", "-b:a:2", "128k"]
-    : [];
-  const variants = hasAudio
-    ? "v:0,a:0,name:360p v:1,a:1,name:720p v:2,a:2,name:1080p"
-    : "v:0,name:360p v:1,name:720p v:2,name:1080p";
+function runVariant(inputUrl, outputDirectory, variant, hasAudio, progressStart, progressSpan, job) {
+  const variantDirectory = join(outputDirectory, variant.name);
   const args = [
     "-hide_banner",
     "-y",
     "-i", inputUrl,
-    "-filter_complex",
-    "[0:v]split=3[v360][v720][v1080];[v360]scale=w=-2:h=360[v360out];[v720]scale=w=-2:h=720[v720out];[v1080]scale=w=-2:h=1080[v1080out]",
-    ...maps,
+    "-map", "0:v:0",
+    ...(hasAudio ? ["-map", "0:a:0"] : []),
+    "-vf", `scale=w=-2:h=${variant.height}`,
     "-c:v", "libx264",
     "-preset", "veryfast",
+    "-threads", "2",
     "-pix_fmt", "yuv420p",
-    "-b:v:0", "700k", "-maxrate:v:0", "800k", "-bufsize:v:0", "1200k",
-    "-b:v:1", "2100k", "-maxrate:v:1", "2400k", "-bufsize:v:1", "3600k",
-    "-b:v:2", "4200k", "-maxrate:v:2", "4800k", "-bufsize:v:2", "7200k",
-    ...audio,
+    "-b:v", variant.bitrate,
+    "-maxrate", variant.maxrate,
+    "-bufsize", variant.bufsize,
+    ...(hasAudio ? ["-c:a", "aac", "-ar", "48000", "-b:a", variant.audioBitrate] : []),
     "-force_key_frames", "expr:gte(t,n_forced*6)",
     "-f", "hls",
     "-hls_time", "6",
     "-hls_playlist_type", "vod",
     "-hls_flags", "independent_segments",
-    "-master_pl_name", "master.m3u8",
-    "-var_stream_map", variants,
-    "-hls_segment_filename", join(outputDirectory, "%v", "segment_%05d.ts"),
+    "-hls_segment_filename", join(variantDirectory, "segment_%05d.ts"),
     "-progress", "pipe:2",
     "-nostats",
-    join(outputDirectory, "%v", "index.m3u8"),
+    join(variantDirectory, "index.m3u8"),
   ];
 
   return new Promise((resolve, reject) => {
@@ -96,15 +86,41 @@ async function runFfmpeg(inputUrl, outputDirectory, job) {
 
       const outTime = chunk.match(/out_time=(\d+:\d+:\d+(?:\.\d+)?)/)?.[1];
       if (outTime && durationSeconds > 0) {
-        job.progress = Math.min(94, Math.max(1, Math.round((parseTimestamp(outTime) / durationSeconds) * 94)));
+        const variantProgress = Math.min(1, parseTimestamp(outTime) / durationSeconds);
+        job.progress = Math.min(94, Math.max(1, Math.round(progressStart + variantProgress * progressSpan)));
       }
     });
     process.once("error", reject);
-    process.once("close", (code) => {
+    process.once("close", (code, signal) => {
       if (code === 0) return resolve();
-      reject(new Error(`FFmpeg terminó con código ${code}. ${diagnostics.trim().slice(-1200)}`));
+      reject(new Error(`FFmpeg terminó con código ${code}${signal ? ` por señal ${signal}` : ""}. ${diagnostics.trim().slice(-1200)}`));
     });
   });
+}
+
+async function runFfmpeg(inputUrl, outputDirectory, job) {
+  const hasAudio = await inputHasAudio(inputUrl);
+  const variants = [
+    { name: "360p", height: 360, bitrate: "650k", maxrate: "750k", bufsize: "1100k", audioBitrate: "96k" },
+    { name: "720p", height: 720, bitrate: "1900k", maxrate: "2200k", bufsize: "3300k", audioBitrate: "128k" },
+  ];
+
+  for (const [index, variant] of variants.entries()) {
+    await runVariant(inputUrl, outputDirectory, variant, hasAudio, index * 47, 47, job);
+  }
+
+  const codecs = hasAudio ? 'CODECS="avc1.64001e,mp4a.40.2"' : 'CODECS="avc1.64001e"';
+  const master = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:3",
+    "#EXT-X-INDEPENDENT-SEGMENTS",
+    `#EXT-X-STREAM-INF:BANDWIDTH=850000,AVERAGE-BANDWIDTH=750000,RESOLUTION=640x360,${codecs}`,
+    "360p/index.m3u8",
+    `#EXT-X-STREAM-INF:BANDWIDTH=2400000,AVERAGE-BANDWIDTH=2050000,RESOLUTION=1280x720,${codecs}`,
+    "720p/index.m3u8",
+    "",
+  ].join("\n");
+  await writeFile(join(outputDirectory, "master.m3u8"), master, "utf8");
 }
 
 async function listFiles(directory) {
@@ -162,7 +178,7 @@ async function processJob(job) {
 
   try {
     await mkdir(outputDirectory, { recursive: true });
-    await Promise.all(["360p", "720p", "1080p"].map((name) => mkdir(join(outputDirectory, name), { recursive: true })));
+    await Promise.all(["360p", "720p"].map((name) => mkdir(join(outputDirectory, name), { recursive: true })));
     job.status = "processing";
     job.progress = 1;
     const inputUrl = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: job.sourceKey }), {

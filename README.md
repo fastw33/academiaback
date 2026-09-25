@@ -9,7 +9,7 @@ Backend independiente de Academia Fastway, construido con Node.js y Express.
 - Cursos con lecciones ordenadas y progreso secuencial.
 - Acceso configurable por alumno.
 - Videos privados en almacenamiento compatible con S3.
-- Streaming HLS adaptativo con calidades 360p, 720p y 1080p.
+- Streaming HLS adaptativo con calidades 360p y 720p.
 
 ## Desarrollo local
 
