@@ -1,0 +1,48 @@
+import mongoose from "mongoose";
+
+const videoSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true },
+    title: { type: String, required: true, trim: true },
+    description: { type: String, default: "" },
+    s3Key: { type: String, required: true },
+    durationLabel: { type: String, default: "" },
+    order: { type: Number, required: true, min: 0 },
+  },
+  { _id: false }
+);
+
+const courseSchema = new mongoose.Schema(
+  {
+    slug: { type: String, required: true, unique: true, default: "principal" },
+    title: { type: String, required: true, default: "Curso principal" },
+    description: { type: String, default: "" },
+    videos: { type: [videoSchema], default: [] },
+    s3Key: { type: String },
+    durationLabel: { type: String, default: "" },
+    active: { type: Boolean, default: true },
+  },
+  { timestamps: true }
+);
+
+const userSchema = new mongoose.Schema(
+  {
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    name: { type: String, required: true, trim: true },
+    passwordHash: { type: String, required: true },
+    role: { type: String, enum: ["student", "admin"], default: "student", required: true },
+    accessStartsAt: { type: Date },
+    accessDurationDays: { type: Number, default: 20, min: 1 },
+    blocked: { type: Boolean, default: false },
+    completedVideoIds: { type: [String], default: [] },
+  },
+  { timestamps: true }
+);
+
+export const Course = mongoose.models.Course || mongoose.model("Course", courseSchema);
+export const User = mongoose.models.User || mongoose.model("User", userSchema);
+
+export async function connectDB() {
+  if (mongoose.connection.readyState === 1) return;
+  await mongoose.connect(process.env.MONGODB_URI);
+}
