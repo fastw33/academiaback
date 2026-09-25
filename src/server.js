@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { pipeline } from "node:stream/promises";
 import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
@@ -6,7 +7,6 @@ import bcrypt from "bcryptjs";
 import { isValidObjectId } from "mongoose";
 import { z } from "zod";
 import { DeleteObjectsCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { connectDB, Course, User } from "./models.js";
 import { clearSessionCookie, createSessionToken, requireAdmin, requireUser, serializeUser, setSessionCookie } from "./auth.js";
 import { getAccessWindow, getCourseVideos, isVideoUnlocked } from "./course-videos.js";
@@ -74,29 +74,63 @@ app.get("/api/course", requireUser, asyncRoute(async (req, res) => {
   });
 }));
 
-app.get("/api/video/play", requireUser, asyncRoute(async (req, res) => {
+async function getAuthorizedVideo(req, res) {
   const course = await Course.findOne({ slug: "principal", active: true });
-  if (!course) return res.status(404).json({ error: "No hay curso activo." });
+  if (!course) {
+    res.status(404).json({ error: "No hay curso activo." });
+    return null;
+  }
   const videos = getCourseVideos(course);
   const video = videos.find((item) => item.id === (req.query.videoId || videos[0]?.id));
-  if (!video) return res.status(404).json({ error: "La lección no existe." });
+  if (!video) {
+    res.status(404).json({ error: "La lección no existe." });
+    return null;
+  }
 
   if (req.user.role !== "admin" && !req.user.accessStartsAt) {
     req.user.accessStartsAt = new Date();
     await req.user.save();
   }
   const access = getAccessWindow(req.user);
-  if (req.user.role !== "admin" && !access.active) return res.status(403).json({ error: "Tu acceso al video está bloqueado." });
+  if (req.user.role !== "admin" && !access.active) {
+    res.status(403).json({ error: "Tu acceso al video está bloqueado." });
+    return null;
+  }
   if (req.user.role !== "admin" && !isVideoUnlocked(videos, video.id, req.user.completedVideoIds || [])) {
-    return res.status(403).json({ error: "Completa las lecciones anteriores para continuar." });
+    res.status(403).json({ error: "Completa las lecciones anteriores para continuar." });
+    return null;
   }
 
-  const url = await getSignedUrl(s3, new GetObjectCommand({
+  return video;
+}
+
+app.get("/api/video/play", requireUser, asyncRoute(async (req, res) => {
+  const video = await getAuthorizedVideo(req, res);
+  if (!video) return;
+
+  const url = `/api/video/stream?videoId=${encodeURIComponent(video.id)}`;
+  res.json({ url, videoId: video.id });
+}));
+
+app.get("/api/video/stream", requireUser, asyncRoute(async (req, res) => {
+  const video = await getAuthorizedVideo(req, res);
+  if (!video) return;
+
+  const object = await s3.send(new GetObjectCommand({
     Bucket: bucket,
     Key: video.s3Key,
-    ResponseContentDisposition: "inline",
-  }), { expiresIn: 120 });
-  res.json({ url, expiresIn: 120, videoId: video.id });
+    ...(req.headers.range ? { Range: req.headers.range } : {}),
+  }));
+
+  res.status(object.ContentRange ? 206 : 200);
+  res.setHeader("Content-Type", object.ContentType || "video/mp4");
+  res.setHeader("Accept-Ranges", object.AcceptRanges || "bytes");
+  res.setHeader("Cache-Control", "private, no-store");
+  res.setHeader("Content-Disposition", "inline");
+  if (object.ContentLength !== undefined) res.setHeader("Content-Length", String(object.ContentLength));
+  if (object.ContentRange) res.setHeader("Content-Range", object.ContentRange);
+  if (!object.Body || typeof object.Body.pipe !== "function") throw new Error("MinIO no devolvió un stream de video.");
+  await pipeline(object.Body, res);
 }));
 
 const progressSchema = z.object({ videoId: z.string().min(1) });
@@ -179,8 +213,30 @@ app.post("/api/admin/upload-url", requireUser, requireAdmin, asyncRoute(async (r
   const id = randomUUID();
   const prefix = (process.env.S3_VIDEO_PREFIX || "courses").replace(/^\/+|\/+$/g, "");
   const key = `${prefix}/${new Date().toISOString().slice(0, 10)}/${id}${extension}`;
-  const url = await getSignedUrl(s3, new PutObjectCommand({ Bucket: bucket, Key: key, ContentType: parsed.data.contentType }), { expiresIn: 300 });
+  const url = `/api/admin/upload?key=${encodeURIComponent(key)}`;
   res.json({ url, key, id });
+}));
+
+app.put("/api/admin/upload", requireUser, requireAdmin, asyncRoute(async (req, res) => {
+  const key = typeof req.query.key === "string" ? req.query.key : "";
+  const prefix = `${(process.env.S3_VIDEO_PREFIX || "courses").replace(/^\/+|\/+$/g, "")}/`;
+  const contentType = req.headers["content-type"] || "video/mp4";
+  const contentLength = Number(req.headers["content-length"]);
+  const maxBytes = Number(process.env.MAX_VIDEO_SIZE_MB || 2048) * 1024 * 1024;
+
+  if (!key.startsWith(prefix)) return res.status(400).json({ error: "Ruta de video inválida." });
+  if (!contentType.startsWith("video/")) return res.status(415).json({ error: "El archivo debe ser un video." });
+  if (!Number.isFinite(contentLength) || contentLength <= 0) return res.status(411).json({ error: "No se recibió el tamaño del video." });
+  if (contentLength > maxBytes) return res.status(413).json({ error: `El video supera el máximo de ${process.env.MAX_VIDEO_SIZE_MB || 2048} MB.` });
+
+  await s3.send(new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    Body: req,
+    ContentLength: contentLength,
+    ContentType: contentType,
+  }));
+  res.status(201).json({ ok: true, key });
 }));
 
 const createUserSchema = z.object({
@@ -242,6 +298,7 @@ app.patch("/api/admin/users/:id", requireUser, requireAdmin, asyncRoute(async (r
 
 app.use((error, _req, res, _next) => {
   console.error(error);
+  if (res.headersSent) return res.destroy();
   res.status(500).json({ error: "Error interno del servidor." });
 });
 
