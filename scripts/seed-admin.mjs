@@ -1,10 +1,11 @@
 import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
 
-const { MONGODB_URI, ADMIN_EMAIL, ADMIN_PASSWORD } = process.env;
+const mongoUri = process.env.MONGO_URI || process.env.MONGODB_URI;
+const { ADMIN_EMAIL, ADMIN_PASSWORD } = process.env;
 
-if (!MONGODB_URI || !ADMIN_EMAIL || !ADMIN_PASSWORD) {
-  console.error("Missing MONGODB_URI, ADMIN_EMAIL or ADMIN_PASSWORD.");
+if (!mongoUri || !ADMIN_EMAIL || !ADMIN_PASSWORD) {
+  console.error("Missing MONGO_URI, ADMIN_EMAIL or ADMIN_PASSWORD.");
   process.exit(1);
 }
 
@@ -22,7 +23,7 @@ const userSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-await mongoose.connect(MONGODB_URI);
+await mongoose.connect(mongoUri);
 const User = mongoose.models.User || mongoose.model("User", userSchema);
 
 const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 12);

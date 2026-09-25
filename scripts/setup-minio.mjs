@@ -12,13 +12,15 @@ import {
 import mongoose from "mongoose";
 
 const required = [
-  "MONGODB_URI",
   "AWS_REGION",
   "AWS_ACCESS_KEY_ID",
   "AWS_SECRET_ACCESS_KEY",
   "S3_BUCKET",
   "S3_ENDPOINT",
 ];
+
+const mongoUri = process.env.MONGO_URI || process.env.MONGODB_URI;
+if (!mongoUri) throw new Error("Missing MONGO_URI");
 
 for (const key of required) {
   if (!process.env[key]) throw new Error(`Missing ${key}`);
@@ -85,7 +87,7 @@ await client.send(
 const object = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
 if (object.ContentLength !== file.size) throw new Error("Uploaded video size does not match source file");
 
-await mongoose.connect(process.env.MONGODB_URI);
+await mongoose.connect(mongoUri);
 const courseSchema = new mongoose.Schema(
   {
     slug: { type: String, required: true, unique: true },
