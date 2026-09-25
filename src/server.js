@@ -10,7 +10,7 @@ import { isValidObjectId } from "mongoose";
 import { z } from "zod";
 import { DeleteObjectsCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { connectDB, Course, User } from "./models.js";
-import { clearSessionCookie, createSessionToken, createUploadToken, requireAdmin, requireUploadToken, requireUser, serializeUser, setSessionCookie } from "./auth.js";
+import { clearSessionCookie, createPlaybackToken, createSessionToken, createUploadToken, requireAdmin, requirePlaybackToken, requireUploadToken, requireUser, serializeUser, setSessionCookie } from "./auth.js";
 import { getAccessWindow, getCourseVideos, isVideoUnlocked } from "./course-videos.js";
 import { bucket, s3 } from "./s3.js";
 
@@ -140,17 +140,23 @@ app.get("/api/video/play", requireUser, asyncRoute(async (req, res) => {
   const video = await getAuthorizedVideo(req, res);
   if (!video) return;
 
-  const url = `/api/video/stream?videoId=${encodeURIComponent(video.id)}`;
+  const configuredApiUrl = (process.env.PUBLIC_API_URL || "").trim().replace(/\/+$/, "");
+  const apiUrl = configuredApiUrl || `${req.protocol}://${req.get("host")}`;
+  const token = await createPlaybackToken({
+    videoId: video.id,
+    key: video.s3Key,
+    userId: req.user._id.toString(),
+  });
+  const url = `${apiUrl}/api/video/stream?videoId=${encodeURIComponent(video.id)}&token=${encodeURIComponent(token)}`;
   res.json({ url, videoId: video.id });
 }));
 
-app.get("/api/video/stream", requireUser, asyncRoute(async (req, res) => {
-  const video = await getAuthorizedVideo(req, res);
-  if (!video) return;
+app.get("/api/video/stream", requirePlaybackToken, asyncRoute(async (req, res) => {
+  if (req.query.videoId !== req.playback.videoId) return res.status(403).json({ error: "Video no autorizado." });
 
   const object = await s3.send(new GetObjectCommand({
     Bucket: bucket,
-    Key: video.s3Key,
+    Key: req.playback.key,
     ...(req.headers.range ? { Range: req.headers.range } : {}),
   }));
 
@@ -159,6 +165,8 @@ app.get("/api/video/stream", requireUser, asyncRoute(async (req, res) => {
   res.setHeader("Accept-Ranges", object.AcceptRanges || "bytes");
   res.setHeader("Cache-Control", "private, no-store");
   res.setHeader("Content-Disposition", "inline");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  res.setHeader("Referrer-Policy", "no-referrer");
   if (object.ContentLength !== undefined) res.setHeader("Content-Length", String(object.ContentLength));
   if (object.ContentRange) res.setHeader("Content-Range", object.ContentRange);
   if (!object.Body || typeof object.Body.pipe !== "function") throw new Error("MinIO no devolvió un stream de video.");
