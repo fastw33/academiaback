@@ -119,10 +119,17 @@ app.get("/api/course", requireUser, asyncRoute(async (req, res) => {
     course: course ? {
       title: course.title,
       description: course.description,
-      videos: videos.map(({ s3Key: _s3Key, ...video }) => video),
+      videos: videos.map(({ s3Key: _s3Key, quiz, ...video }) => ({
+        ...video,
+        quiz: quiz ? {
+          passingScore: quiz.passingScore,
+          questions: quiz.questions.map(({ correctOptionIndex: _correctOptionIndex, ...question }) => question),
+        } : null,
+      })),
     } : null,
     access: getAccessWindow(req.user),
     completedVideoIds: req.user.completedVideoIds || [],
+    watchedVideoIds: req.user.watchedVideoIds || [],
   });
 }));
 
@@ -243,19 +250,91 @@ app.post("/api/video/progress", requireUser, asyncRoute(async (req, res) => {
   if (req.user.role !== "admin" && !isVideoUnlocked(videos, video.id, completed)) {
     return res.status(403).json({ error: "Completa las lecciones anteriores para continuar." });
   }
+  const watched = req.user.watchedVideoIds || [];
+  if (!watched.includes(video.id)) req.user.watchedVideoIds = [...watched, video.id];
+  if (video.quiz?.questions?.length) {
+    await req.user.save();
+    return res.json({ completedVideoIds: completed, requiresQuiz: true });
+  }
   if (!completed.includes(video.id)) {
     req.user.completedVideoIds = [...completed, video.id];
-    await req.user.save();
   }
+  await req.user.save();
   res.json({ completedVideoIds: req.user.completedVideoIds });
 }));
 
+const quizSubmissionSchema = z.object({
+  videoId: z.string().min(1),
+  answers: z.array(z.object({
+    questionId: z.string().min(1),
+    optionIndex: z.number().int().min(0).max(3),
+  })).min(5).max(6),
+});
+app.post("/api/video/quiz", requireUser, asyncRoute(async (req, res) => {
+  const parsed = quizSubmissionSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Respuestas inválidas." });
+  const course = await Course.findOne({ slug: "principal", active: true });
+  if (!course) return res.status(404).json({ error: "No hay curso activo." });
+  if (req.user.role !== "admin" && !getAccessWindow(req.user).active) {
+    return res.status(403).json({ error: "Tu acceso al curso está bloqueado." });
+  }
+
+  const videos = getCourseVideos(course);
+  const video = videos.find((item) => item.id === parsed.data.videoId);
+  if (!video?.quiz || video.quiz.questions.length < 5) {
+    return res.status(404).json({ error: "Esta lección no tiene evaluación." });
+  }
+  const completed = req.user.completedVideoIds || [];
+  if (req.user.role !== "admin" && !isVideoUnlocked(videos, video.id, completed)) {
+    return res.status(403).json({ error: "Completa las lecciones anteriores para continuar." });
+  }
+  if (req.user.role !== "admin" && !(req.user.watchedVideoIds || []).includes(video.id)) {
+    return res.status(403).json({ error: "Debes finalizar el video antes de presentar la evaluación." });
+  }
+
+  const answers = new Map(parsed.data.answers.map((answer) => [answer.questionId, answer.optionIndex]));
+  if (answers.size !== video.quiz.questions.length || video.quiz.questions.some((question) => !answers.has(question.id))) {
+    return res.status(400).json({ error: "Responde todas las preguntas antes de calificar." });
+  }
+  const correct = video.quiz.questions.reduce(
+    (total, question) => total + (answers.get(question.id) === question.correctOptionIndex ? 1 : 0),
+    0
+  );
+  const score = Math.round((correct / video.quiz.questions.length) * 100);
+  const passed = score >= video.quiz.passingScore;
+  req.user.quizAttempts = [
+    ...(req.user.quizAttempts || []).slice(-99),
+    { videoId: video.id, score, passed, attemptedAt: new Date() },
+  ];
+  if (passed && !completed.includes(video.id)) req.user.completedVideoIds = [...completed, video.id];
+  await req.user.save();
+
+  res.json({
+    score,
+    passed,
+    correct,
+    total: video.quiz.questions.length,
+    passingScore: video.quiz.passingScore,
+    completedVideoIds: req.user.completedVideoIds || [],
+  });
+}));
+
+const quizQuestionSchema = z.object({
+  id: z.string().min(1),
+  prompt: z.string().trim().min(3).max(500),
+  options: z.array(z.string().trim().min(1).max(250)).length(4),
+  correctOptionIndex: z.number().int().min(0).max(3),
+});
 const videoSchema = z.object({
   id: z.string().min(1),
   title: z.string().min(2),
   description: z.string().optional().default(""),
   s3Key: z.string().min(3),
   durationLabel: z.string().optional().default(""),
+  quiz: z.object({
+    passingScore: z.number().int().min(90).max(100).default(90),
+    questions: z.array(quizQuestionSchema).min(5).max(6),
+  }).nullable().optional().default(null),
 });
 const courseSchema = z.object({
   title: z.string().min(2),
@@ -273,8 +352,13 @@ app.put("/api/admin/course", requireUser, requireAdmin, asyncRoute(async (req, r
   if (!parsed.success) return res.status(400).json({ error: "Datos del curso inválidos." });
   const videos = parsed.data.videos.map((video, order) => ({ ...video, order }));
   const currentCourse = await Course.findOne({ slug: "principal" });
+  const currentVideos = currentCourse ? getCourseVideos(currentCourse) : [];
+  const changedQuizVideoIds = videos.flatMap((video) => {
+    const currentVideo = currentVideos.find((item) => item.id === video.id);
+    return JSON.stringify(currentVideo?.quiz || null) === JSON.stringify(video.quiz || null) ? [] : [video.id];
+  });
   const staleVideos = currentCourse
-    ? getCourseVideos(currentCourse).filter((video) => {
+    ? currentVideos.filter((video) => {
       const nextVideo = videos.find((item) => item.id === video.id);
       return !nextVideo || nextVideo.s3Key !== video.s3Key;
     })
@@ -295,6 +379,18 @@ app.put("/api/admin/course", requireUser, requireAdmin, asyncRoute(async (req, r
   );
   if (staleVideos.length) {
     await Promise.all(staleVideos.map((video) => deleteVideoObjects(video.s3Key)));
+  }
+  if (changedQuizVideoIds.length) {
+    await User.updateMany(
+      { role: "student" },
+      {
+        $pull: {
+          completedVideoIds: { $in: changedQuizVideoIds },
+          watchedVideoIds: { $in: changedQuizVideoIds },
+          quizAttempts: { videoId: { $in: changedQuizVideoIds } },
+        },
+      }
+    );
   }
   res.json({ course });
 }));
@@ -452,6 +548,8 @@ app.patch("/api/admin/users/:id", requireUser, requireAdmin, asyncRoute(async (r
   if (parsed.data.resetAccess) {
     user.accessStartsAt = undefined;
     user.completedVideoIds = [];
+    user.watchedVideoIds = [];
+    user.quizAttempts = [];
   }
   if (parsed.data.password) user.passwordHash = await bcrypt.hash(parsed.data.password, 12);
   await user.save();

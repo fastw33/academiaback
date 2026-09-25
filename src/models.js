@@ -1,5 +1,23 @@
 import mongoose from "mongoose";
 
+const quizQuestionSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true },
+    prompt: { type: String, required: true, trim: true },
+    options: { type: [String], required: true, validate: (options) => options.length === 4 },
+    correctOptionIndex: { type: Number, required: true, min: 0, max: 3 },
+  },
+  { _id: false }
+);
+
+const quizSchema = new mongoose.Schema(
+  {
+    passingScore: { type: Number, default: 90, min: 90, max: 100 },
+    questions: { type: [quizQuestionSchema], default: [] },
+  },
+  { _id: false }
+);
+
 const videoSchema = new mongoose.Schema(
   {
     id: { type: String, required: true },
@@ -8,6 +26,17 @@ const videoSchema = new mongoose.Schema(
     s3Key: { type: String, required: true },
     durationLabel: { type: String, default: "" },
     order: { type: Number, required: true, min: 0 },
+    quiz: { type: quizSchema, default: undefined },
+  },
+  { _id: false }
+);
+
+const quizAttemptSchema = new mongoose.Schema(
+  {
+    videoId: { type: String, required: true },
+    score: { type: Number, required: true, min: 0, max: 100 },
+    passed: { type: Boolean, required: true },
+    attemptedAt: { type: Date, default: Date.now },
   },
   { _id: false }
 );
@@ -35,6 +64,8 @@ const userSchema = new mongoose.Schema(
     accessDurationDays: { type: Number, default: 20, min: 1 },
     blocked: { type: Boolean, default: false },
     completedVideoIds: { type: [String], default: [] },
+    watchedVideoIds: { type: [String], default: [] },
+    quizAttempts: { type: [quizAttemptSchema], default: [] },
   },
   { timestamps: true }
 );

@@ -8,6 +8,15 @@ export function getCourseVideos(course) {
         s3Key: video.s3Key,
         durationLabel: video.durationLabel || "",
         order: video.order,
+        quiz: video.quiz?.questions?.length ? {
+          passingScore: video.quiz.passingScore || 90,
+          questions: video.quiz.questions.map((question) => ({
+            id: question.id,
+            prompt: question.prompt,
+            options: [...question.options],
+            correctOptionIndex: question.correctOptionIndex,
+          })),
+        } : null,
       }))
       .sort((a, b) => a.order - b.order);
   }
@@ -19,6 +28,7 @@ export function getCourseVideos(course) {
     s3Key: course.s3Key,
     durationLabel: course.durationLabel || "Video principal",
     order: 0,
+    quiz: null,
   }];
 }
 
