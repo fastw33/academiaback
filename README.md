@@ -9,6 +9,7 @@ Backend independiente de Academia Fastway, construido con Node.js y Express.
 - Cursos con lecciones ordenadas y progreso secuencial.
 - Acceso configurable por alumno.
 - Videos privados en almacenamiento compatible con S3.
+- Streaming HLS adaptativo con calidades 360p, 720p y 1080p.
 
 ## Desarrollo local
 
@@ -37,3 +38,8 @@ npm start
 URL con tokens temporales para evitar que Next.js almacene archivos grandes en
 memoria o intermedie la reproducción. Incluye la URL del frontend en
 `CORS_ORIGINS`.
+
+Los videos nuevos se convierten desde el panel a segmentos HLS de seis segundos.
+La cola procesa un video a la vez y reemplaza el original únicamente después de
+guardar todas las calidades en S3. Los videos publicados anteriormente se pueden
+convertir con la acción **Optimizar para conexiones lentas** del administrador.

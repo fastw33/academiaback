@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createServer, IncomingMessage } from "node:http";
+import { posix } from "node:path";
 import { PassThrough } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import express from "express";
@@ -8,11 +9,12 @@ import cookieParser from "cookie-parser";
 import bcrypt from "bcryptjs";
 import { isValidObjectId } from "mongoose";
 import { z } from "zod";
-import { DeleteObjectsCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { DeleteObjectsCommand, GetObjectCommand, ListObjectsV2Command, PutObjectCommand } from "@aws-sdk/client-s3";
 import { connectDB, Course, User } from "./models.js";
 import { clearSessionCookie, createPlaybackToken, createSessionToken, createUploadToken, requireAdmin, requirePlaybackToken, requireUploadToken, requireUser, serializeUser, setSessionCookie } from "./auth.js";
 import { getAccessWindow, getCourseVideos, isVideoUnlocked } from "./course-videos.js";
 import { bucket, s3 } from "./s3.js";
+import { enqueueVideoOptimization, getVideoOptimization } from "./video-processing.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -33,6 +35,24 @@ function observeTransferErrors(stream, req, label) {
   stream.on("error", (error) => {
     if (!isClientDisconnect(error, req)) console.error(`${label} stream error:`, error);
   });
+}
+
+async function deleteVideoObjects(key) {
+  if (!key.endsWith(".m3u8")) {
+    await s3.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: [{ Key: key }], Quiet: true } }));
+    return;
+  }
+
+  const prefix = key.slice(0, key.lastIndexOf("/") + 1);
+  let continuationToken;
+  do {
+    const listed = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: continuationToken }));
+    const objects = (listed.Contents || []).flatMap((item) => item.Key ? [{ Key: item.Key }] : []);
+    if (objects.length) {
+      await s3.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects, Quiet: true } }));
+    }
+    continuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
+  } while (continuationToken);
 }
 
 class SafeIncomingMessage extends IncomingMessage {
@@ -148,22 +168,52 @@ app.get("/api/video/play", requireUser, asyncRoute(async (req, res) => {
     userId: req.user._id.toString(),
   });
   const url = `${apiUrl}/api/video/stream?videoId=${encodeURIComponent(video.id)}&token=${encodeURIComponent(token)}`;
-  res.json({ url, videoId: video.id });
+  res.json({ url, videoId: video.id, type: video.s3Key.endsWith(".m3u8") ? "hls" : "file" });
 }));
 
 app.get("/api/video/stream", requirePlaybackToken, asyncRoute(async (req, res) => {
   if (req.query.videoId !== req.playback.videoId) return res.status(403).json({ error: "Video no autorizado." });
 
+  const isHls = req.playback.key.endsWith(".m3u8");
+  const hlsPrefix = isHls ? req.playback.key.slice(0, req.playback.key.lastIndexOf("/") + 1) : "";
+  const requestedPath = typeof req.query.path === "string" ? req.query.path : "";
+  const normalizedPath = requestedPath ? posix.normalize(requestedPath).replace(/^\/+/, "") : "master.m3u8";
+  if (isHls && (normalizedPath.startsWith("..") || normalizedPath.includes("/../"))) {
+    return res.status(403).json({ error: "Segmento no autorizado." });
+  }
+  const objectKey = isHls ? `${hlsPrefix}${normalizedPath}` : req.playback.key;
+
   const object = await s3.send(new GetObjectCommand({
     Bucket: bucket,
-    Key: req.playback.key,
+    Key: objectKey,
     ...(req.headers.range ? { Range: req.headers.range } : {}),
   }));
+
+  if (isHls && objectKey.endsWith(".m3u8")) {
+    const manifest = await object.Body.transformToString();
+    const configuredApiUrl = (process.env.PUBLIC_API_URL || "").trim().replace(/\/+$/, "");
+    const apiUrl = configuredApiUrl || `${req.protocol}://${req.get("host")}`;
+    const currentPath = normalizedPath;
+    const rewritten = manifest.split(/\r?\n/).map((line) => {
+      const value = line.trim();
+      if (!value || value.startsWith("#") || /^https?:\/\//i.test(value)) return line;
+      const resource = value.replace(/\\/g, "/");
+      const path = posix.normalize(posix.join(posix.dirname(currentPath), resource));
+      const query = new URLSearchParams({ videoId: req.playback.videoId, token: req.query.token, path });
+      return `${apiUrl}/api/video/stream?${query}`;
+    }).join("\n");
+
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.setHeader("Cache-Control", "private, max-age=60");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    return res.send(rewritten);
+  }
 
   res.status(object.ContentRange ? 206 : 200);
   res.setHeader("Content-Type", object.ContentType || "video/mp4");
   res.setHeader("Accept-Ranges", object.AcceptRanges || "bytes");
-  res.setHeader("Cache-Control", "private, no-store");
+  res.setHeader("Cache-Control", isHls ? "private, max-age=21600, immutable" : "private, no-store");
   res.setHeader("Content-Disposition", "inline");
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   res.setHeader("Referrer-Policy", "no-referrer");
@@ -223,16 +273,12 @@ app.put("/api/admin/course", requireUser, requireAdmin, asyncRoute(async (req, r
   if (!parsed.success) return res.status(400).json({ error: "Datos del curso inválidos." });
   const videos = parsed.data.videos.map((video, order) => ({ ...video, order }));
   const currentCourse = await Course.findOne({ slug: "principal" });
-  const removedVideos = currentCourse
-    ? getCourseVideos(currentCourse).filter((video) => !videos.some((nextVideo) => nextVideo.id === video.id))
+  const staleVideos = currentCourse
+    ? getCourseVideos(currentCourse).filter((video) => {
+      const nextVideo = videos.find((item) => item.id === video.id);
+      return !nextVideo || nextVideo.s3Key !== video.s3Key;
+    })
     : [];
-
-  if (removedVideos.length) {
-    await s3.send(new DeleteObjectsCommand({
-      Bucket: bucket,
-      Delete: { Objects: removedVideos.map((video) => ({ Key: video.s3Key })), Quiet: true },
-    }));
-  }
 
   const course = await Course.findOneAndUpdate(
     { slug: "principal" },
@@ -247,6 +293,9 @@ app.put("/api/admin/course", requireUser, requireAdmin, asyncRoute(async (req, r
     },
     { upsert: true, returnDocument: "after" }
   );
+  if (staleVideos.length) {
+    await Promise.all(staleVideos.map((video) => deleteVideoObjects(video.s3Key)));
+  }
   res.json({ course });
 }));
 
@@ -264,6 +313,31 @@ app.post("/api/admin/upload-url", requireUser, requireAdmin, asyncRoute(async (r
   const token = await createUploadToken(key);
   res.json({ url, token, key, id });
 }));
+
+const optimizeVideoSchema = z.object({
+  id: z.string().min(1),
+  key: z.string().min(3),
+  originalBytes: z.number().int().positive().optional(),
+});
+app.post("/api/admin/videos/optimize", requireUser, requireAdmin, asyncRoute(async (req, res) => {
+  const parsed = optimizeVideoSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Video inválido." });
+  const prefix = `${(process.env.S3_VIDEO_PREFIX || "courses").replace(/^\/+|\/+$/g, "")}/`;
+  if (!parsed.data.key.startsWith(prefix)) return res.status(403).json({ error: "Ruta de video no autorizada." });
+
+  const job = enqueueVideoOptimization({
+    id: parsed.data.id,
+    sourceKey: parsed.data.key,
+    originalBytes: parsed.data.originalBytes,
+  });
+  res.status(job.status === "done" ? 200 : 202).json({ job });
+}));
+
+app.get("/api/admin/videos/:id/optimize", requireUser, requireAdmin, (req, res) => {
+  const job = getVideoOptimization(req.params.id);
+  if (!job) return res.status(404).json({ error: "No existe una optimización para este video." });
+  res.json({ job });
+});
 
 app.put("/api/admin/upload", requireUploadToken, asyncRoute(async (req, res) => {
   const key = typeof req.query.key === "string" ? req.query.key : "";
