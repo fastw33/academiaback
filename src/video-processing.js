@@ -1,13 +1,16 @@
 import { spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, relative } from "node:path";
+import { pipeline } from "node:stream/promises";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import ffmpegPath from "ffmpeg-static";
 import { Course } from "./models.js";
 import { bucket, s3 } from "./s3.js";
+
+const ffmpegPath = process.env.FFMPEG_PATH || (process.platform === "win32"
+  ? (await import("ffmpeg-static")).default
+  : "ffmpeg");
 
 const jobs = new Map();
 const queue = [];
@@ -175,16 +178,21 @@ async function replacePublishedVideo(job) {
 async function processJob(job) {
   const workingDirectory = await mkdtemp(join(tmpdir(), "fastway-video-"));
   const outputDirectory = join(workingDirectory, "hls");
+  const inputPath = join(workingDirectory, `source${extname(job.sourceKey) || ".mp4"}`);
 
   try {
     await mkdir(outputDirectory, { recursive: true });
     await Promise.all(["360p", "720p"].map((name) => mkdir(join(outputDirectory, name), { recursive: true })));
+    job.status = "downloading";
+    job.progress = 0;
+    const source = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: job.sourceKey }));
+    if (!source.Body || typeof source.Body.pipe !== "function") throw new Error("MinIO no devolvió el archivo original.");
+    if (source.ContentLength !== undefined) job.originalBytes = source.ContentLength;
+    await pipeline(source.Body, createWriteStream(inputPath));
+
     job.status = "processing";
     job.progress = 1;
-    const inputUrl = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: job.sourceKey }), {
-      expiresIn: 6 * 60 * 60,
-    });
-    await runFfmpeg(inputUrl, outputDirectory, job);
+    await runFfmpeg(inputPath, outputDirectory, job);
 
     job.status = "uploading";
     job.progress = 95;

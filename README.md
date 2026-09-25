@@ -43,3 +43,5 @@ Los videos nuevos se convierten desde el panel a segmentos HLS de seis segundos.
 La cola procesa un video a la vez y reemplaza el original únicamente después de
 guardar todas las calidades en S3. Los videos publicados anteriormente se pueden
 convertir con la acción **Optimizar para conexiones lentas** del administrador.
+El despliegue Nixpacks instala FFmpeg nativo mediante `nixpacks.toml`; durante la
+conversión el archivo original se descarga al almacenamiento temporal del backend.
