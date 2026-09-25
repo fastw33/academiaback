@@ -130,7 +130,11 @@ app.get("/api/video/stream", requireUser, asyncRoute(async (req, res) => {
   if (object.ContentLength !== undefined) res.setHeader("Content-Length", String(object.ContentLength));
   if (object.ContentRange) res.setHeader("Content-Range", object.ContentRange);
   if (!object.Body || typeof object.Body.pipe !== "function") throw new Error("MinIO no devolvió un stream de video.");
-  await pipeline(object.Body, res);
+  try {
+    await pipeline(object.Body, res);
+  } catch (error) {
+    if (!["ERR_STREAM_PREMATURE_CLOSE", "ECONNRESET"].includes(error?.code)) throw error;
+  }
 }));
 
 const progressSchema = z.object({ videoId: z.string().min(1) });
