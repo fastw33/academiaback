@@ -128,8 +128,83 @@ function getLatestQuizAttempt(user, videoId) {
   };
 }
 
+function serializeCourseSummary(course) {
+  const videos = getCourseVideos(course);
+  return {
+    id: course._id.toString(),
+    title: course.title,
+    description: course.description || "",
+    lessonCount: videos.length,
+    active: course.active !== false,
+  };
+}
+
+async function findCourse(courseId, { activeOnly = true } = {}) {
+  const activeFilter = activeOnly ? { active: true } : {};
+  if (courseId && isValidObjectId(courseId)) {
+    return Course.findOne({ _id: courseId, ...activeFilter });
+  }
+  return Course.findOne({ slug: "principal", ...activeFilter })
+    .then((course) => course || Course.findOne(activeFilter).sort({ createdAt: 1 }));
+}
+
+async function findCourseByVideoId(videoId) {
+  const byEmbeddedVideo = await Course.findOne({ active: true, "videos.id": videoId });
+  if (byEmbeddedVideo) return byEmbeddedVideo;
+  if (videoId === "video-principal") return Course.findOne({ slug: "principal", active: true });
+  return null;
+}
+
+function buildCourseProgress(user, course) {
+  const videos = getCourseVideos(course);
+  const completedIds = getValidatedCompletedVideoIds(videos, user);
+  const watchedIds = new Set([...(user.watchedVideoIds || []), ...(user.completedVideoIds || [])]);
+  const lessons = videos.map((video, index) => {
+    const attempt = getLatestQuizAttempt(user, video.id);
+    return {
+      id: video.id,
+      title: video.title,
+      order: index,
+      watched: watchedIds.has(video.id),
+      completed: completedIds.includes(video.id),
+      hasQuiz: Boolean(video.quiz?.questions?.length),
+      lastAttempt: attempt ? {
+        score: attempt.score,
+        passed: attempt.passed,
+        correct: attempt.correct,
+        total: attempt.total,
+        attemptedAt: attempt.attemptedAt,
+      } : null,
+    };
+  });
+  const completedLessons = lessons.filter((lesson) => lesson.completed).length;
+  return {
+    courseId: course._id.toString(),
+    title: course.title,
+    lessonCount: lessons.length,
+    completedLessons,
+    percentage: lessons.length ? Math.round((completedLessons / lessons.length) * 100) : 0,
+    lessons,
+  };
+}
+
+function serializeManagedUser(user, courses) {
+  return {
+    ...serializeUser(user),
+    progress: courses.map((course) => buildCourseProgress(user, course)),
+  };
+}
+
 app.get("/api/course", requireUser, asyncRoute(async (req, res) => {
-  const course = await Course.findOne({ slug: "principal", active: true }).lean();
+  const availableCourses = await Course.find({ active: true }).sort({ createdAt: 1 });
+  const requestedCourseId = typeof req.query.courseId === "string" ? req.query.courseId : "";
+  const requestedCourse = requestedCourseId && isValidObjectId(requestedCourseId)
+    ? availableCourses.find((item) => item._id.toString() === requestedCourseId)
+    : null;
+  const course = requestedCourse
+    || availableCourses.find((item) => item.slug === "principal")
+    || availableCourses[0]
+    || null;
   const videos = course ? getCourseVideos(course) : [];
   const completedVideoIds = getValidatedCompletedVideoIds(videos, req.user);
   const watchedVideoIds = [...new Set([
@@ -139,6 +214,7 @@ app.get("/api/course", requireUser, asyncRoute(async (req, res) => {
   res.json({
     user: serializeUser(req.user),
     course: course ? {
+      id: course._id.toString(),
       title: course.title,
       description: course.description,
       videos: videos.map(({ s3Key: _s3Key, quiz, ...video }) => {
@@ -156,17 +232,19 @@ app.get("/api/course", requireUser, asyncRoute(async (req, res) => {
     access: getAccessWindow(req.user),
     completedVideoIds,
     watchedVideoIds,
+    courses: availableCourses.map(serializeCourseSummary),
   });
 }));
 
 async function getAuthorizedVideo(req, res) {
-  const course = await Course.findOne({ slug: "principal", active: true });
+  const requestedVideoId = typeof req.query.videoId === "string" ? req.query.videoId : "";
+  const course = await findCourseByVideoId(requestedVideoId);
   if (!course) {
     res.status(404).json({ error: "No hay curso activo." });
     return null;
   }
   const videos = getCourseVideos(course);
-  const video = videos.find((item) => item.id === (req.query.videoId || videos[0]?.id));
+  const video = videos.find((item) => item.id === (requestedVideoId || videos[0]?.id));
   if (!video) {
     res.status(404).json({ error: "La lección no existe." });
     return null;
@@ -266,7 +344,7 @@ const progressSchema = z.object({ videoId: z.string().min(1) });
 app.post("/api/video/progress", requireUser, asyncRoute(async (req, res) => {
   const parsed = progressSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Lección inválida." });
-  const course = await Course.findOne({ slug: "principal", active: true });
+  const course = await findCourseByVideoId(parsed.data.videoId);
   if (!course) return res.status(404).json({ error: "No hay curso activo." });
   if (req.user.role !== "admin" && !getAccessWindow(req.user).active) return res.status(403).json({ error: "Tu acceso al curso está bloqueado." });
 
@@ -301,7 +379,7 @@ const quizSubmissionSchema = z.object({
 app.post("/api/video/quiz", requireUser, asyncRoute(async (req, res) => {
   const parsed = quizSubmissionSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Respuestas inválidas." });
-  const course = await Course.findOne({ slug: "principal", active: true });
+  const course = await findCourseByVideoId(parsed.data.videoId);
   if (!course) return res.status(404).json({ error: "No hay curso activo." });
   if (req.user.role !== "admin" && !getAccessWindow(req.user).active) {
     return res.status(403).json({ error: "Tu acceso al curso está bloqueado." });
@@ -391,16 +469,51 @@ const courseSchema = z.object({
   videos: z.array(videoSchema).min(1).max(100),
 });
 
-app.get("/api/admin/course", requireUser, requireAdmin, asyncRoute(async (_req, res) => {
-  const course = await Course.findOne({ slug: "principal" }).lean();
-  res.json({ course: course ? { title: course.title, description: course.description, videos: getCourseVideos(course) } : null });
+const createCourseSchema = z.object({
+  title: z.string().trim().min(2).max(150),
+  description: z.string().trim().max(1000).optional().default(""),
+});
+
+app.get("/api/admin/courses", requireUser, requireAdmin, asyncRoute(async (_req, res) => {
+  const courses = await Course.find().sort({ createdAt: 1 });
+  res.json({ courses: courses.map(serializeCourseSummary) });
+}));
+
+app.post("/api/admin/courses", requireUser, requireAdmin, asyncRoute(async (req, res) => {
+  const parsed = createCourseSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Datos del curso inválidos." });
+  const course = await Course.create({
+    slug: `course-${randomUUID()}`,
+    title: parsed.data.title,
+    description: parsed.data.description,
+    videos: [],
+    active: true,
+  });
+  res.status(201).json({ course: serializeCourseSummary(course) });
+}));
+
+app.get("/api/admin/course", requireUser, requireAdmin, asyncRoute(async (req, res) => {
+  const courseId = typeof req.query.courseId === "string" ? req.query.courseId : "";
+  if (courseId && !isValidObjectId(courseId)) return res.status(400).json({ error: "Curso inválido." });
+  const course = await findCourse(courseId, { activeOnly: false });
+  res.json({
+    course: course ? {
+      id: course._id.toString(),
+      title: course.title,
+      description: course.description,
+      videos: getCourseVideos(course),
+    } : null,
+  });
 }));
 
 app.put("/api/admin/course", requireUser, requireAdmin, asyncRoute(async (req, res) => {
   const parsed = courseSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Datos del curso inválidos." });
+  const courseId = typeof req.query.courseId === "string" ? req.query.courseId : "";
+  if (courseId && !isValidObjectId(courseId)) return res.status(400).json({ error: "Curso inválido." });
   const videos = parsed.data.videos.map((video, order) => ({ ...video, order }));
-  const currentCourse = await Course.findOne({ slug: "principal" });
+  const currentCourse = await findCourse(courseId, { activeOnly: false });
+  if (!currentCourse) return res.status(404).json({ error: "El curso no existe." });
   const currentVideos = currentCourse ? getCourseVideos(currentCourse) : [];
   const changedQuizVideoIds = videos.flatMap((video) => {
     const currentVideo = currentVideos.find((item) => item.id === video.id);
@@ -414,17 +527,16 @@ app.put("/api/admin/course", requireUser, requireAdmin, asyncRoute(async (req, r
     : [];
 
   const course = await Course.findOneAndUpdate(
-    { slug: "principal" },
+    { _id: currentCourse._id },
     {
       title: parsed.data.title,
       description: parsed.data.description,
       videos,
       s3Key: videos[0].s3Key,
       durationLabel: videos[0].durationLabel,
-      slug: "principal",
       active: true,
     },
-    { upsert: true, returnDocument: "after" }
+    { returnDocument: "after" }
   );
   if (staleVideos.length) {
     await Promise.all(staleVideos.map((video) => deleteVideoObjects(video.s3Key)));
@@ -441,17 +553,26 @@ app.put("/api/admin/course", requireUser, requireAdmin, asyncRoute(async (req, r
       }
     );
   }
-  res.json({ course });
+  res.json({ course: { ...course.toObject(), id: course._id.toString() } });
 }));
 
-const uploadSchema = z.object({ filename: z.string().min(1), contentType: z.string().min(3).default("video/mp4") });
+const uploadSchema = z.object({
+  filename: z.string().min(1),
+  contentType: z.string().min(3).default("video/mp4"),
+  courseId: z.string().optional(),
+});
 app.post("/api/admin/upload-url", requireUser, requireAdmin, asyncRoute(async (req, res) => {
   const parsed = uploadSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Archivo inválido." });
+  if (parsed.data.courseId && !isValidObjectId(parsed.data.courseId)) return res.status(400).json({ error: "Curso inválido." });
+  if (parsed.data.courseId && !(await Course.exists({ _id: parsed.data.courseId }))) {
+    return res.status(404).json({ error: "El curso no existe." });
+  }
   const extension = parsed.data.filename.toLowerCase().match(/\.(mp4|mov|m4v|webm)$/)?.[0] || ".mp4";
   const id = randomUUID();
   const prefix = (process.env.S3_VIDEO_PREFIX || "courses").replace(/^\/+|\/+$/g, "");
-  const key = `${prefix}/${new Date().toISOString().slice(0, 10)}/${id}${extension}`;
+  const coursePrefix = parsed.data.courseId || "principal";
+  const key = `${prefix}/${coursePrefix}/${new Date().toISOString().slice(0, 10)}/${id}${extension}`;
   const configuredApiUrl = (process.env.PUBLIC_API_URL || "").trim().replace(/\/+$/, "");
   const apiUrl = configuredApiUrl || `${req.protocol}://${req.get("host")}`;
   const url = `${apiUrl}/api/admin/upload?key=${encodeURIComponent(key)}`;
@@ -553,8 +674,11 @@ const createUserSchema = z.object({
   accessDurationDays: z.number().min(1).max(365).default(20),
 });
 app.get("/api/admin/users", requireUser, requireAdmin, asyncRoute(async (_req, res) => {
-  const users = await User.find({ role: "student" }).sort({ createdAt: -1 });
-  res.json({ users: users.map(serializeUser) });
+  const [users, courses] = await Promise.all([
+    User.find({ role: "student" }).sort({ createdAt: -1 }),
+    Course.find({ active: true }).sort({ createdAt: 1 }),
+  ]);
+  res.json({ users: users.map((user) => serializeManagedUser(user, courses)) });
 }));
 
 app.post("/api/admin/users", requireUser, requireAdmin, asyncRoute(async (req, res) => {
@@ -569,7 +693,8 @@ app.post("/api/admin/users", requireUser, requireAdmin, asyncRoute(async (req, r
     role: "student",
     accessDurationDays: parsed.data.accessDurationDays,
   });
-  res.json({ user: serializeUser(user) });
+  const courses = await Course.find({ active: true }).sort({ createdAt: 1 });
+  res.json({ user: serializeManagedUser(user, courses) });
 }));
 
 const updateUserSchema = z.object({
@@ -602,7 +727,46 @@ app.patch("/api/admin/users/:id", requireUser, requireAdmin, asyncRoute(async (r
   }
   if (parsed.data.password) user.passwordHash = await bcrypt.hash(parsed.data.password, 12);
   await user.save();
-  res.json({ user: serializeUser(user) });
+  const courses = await Course.find({ active: true }).sort({ createdAt: 1 });
+  res.json({ user: serializeManagedUser(user, courses) });
+}));
+
+const resetProgressSchema = z.object({
+  courseId: z.string().min(1),
+  videoId: z.string().min(1),
+  scope: z.enum(["module", "quiz"]),
+});
+
+app.post("/api/admin/users/:id/progress/reset", requireUser, requireAdmin, asyncRoute(async (req, res) => {
+  const parsed = resetProgressSchema.safeParse(req.body);
+  if (!parsed.success || !isValidObjectId(req.params.id) || !isValidObjectId(parsed.data.courseId)) {
+    return res.status(400).json({ error: "Solicitud de reinicio inválida." });
+  }
+  const [user, course] = await Promise.all([
+    User.findOne({ _id: req.params.id, role: "student" }),
+    Course.findById(parsed.data.courseId),
+  ]);
+  if (!user) return res.status(404).json({ error: "Alumno no encontrado." });
+  if (!course) return res.status(404).json({ error: "Curso no encontrado." });
+
+  const videos = getCourseVideos(course);
+  const lessonIndex = videos.findIndex((video) => video.id === parsed.data.videoId);
+  if (lessonIndex < 0) return res.status(404).json({ error: "Módulo no encontrado." });
+  if (parsed.data.scope === "quiz" && !videos[lessonIndex].quiz?.questions?.length) {
+    return res.status(400).json({ error: "Este módulo no tiene evaluación." });
+  }
+
+  const affectedIds = new Set(videos.slice(lessonIndex).map((video) => video.id));
+  const laterIds = new Set(videos.slice(lessonIndex + 1).map((video) => video.id));
+  user.completedVideoIds = (user.completedVideoIds || []).filter((videoId) => !affectedIds.has(videoId));
+  user.watchedVideoIds = (user.watchedVideoIds || []).filter((videoId) => (
+    parsed.data.scope === "quiz" ? !laterIds.has(videoId) : !affectedIds.has(videoId)
+  ));
+  user.quizAttempts = (user.quizAttempts || []).filter((attempt) => !affectedIds.has(attempt.videoId));
+  await user.save();
+
+  const courses = await Course.find({ active: true }).sort({ createdAt: 1 });
+  res.json({ user: serializeManagedUser(user, courses) });
 }));
 
 app.use((error, req, res, _next) => {
