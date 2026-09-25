@@ -26,6 +26,7 @@ function publicJob(job) {
     error: job.error || null,
     originalBytes: job.originalBytes || null,
     optimizedBytes: job.optimizedBytes || null,
+    warning: job.warning || null,
   };
 }
 
@@ -58,8 +59,10 @@ function runVariant(inputUrl, outputDirectory, variant, hasAudio, progressStart,
     ...(hasAudio ? ["-map", "0:a:0"] : []),
     "-vf", `scale=w=-2:h=${variant.height}`,
     "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-threads", "2",
+    "-preset", "ultrafast",
+    "-tune", "zerolatency",
+    "-threads", "1",
+    "-filter_threads", "1",
     "-pix_fmt", "yuv420p",
     "-b:v", variant.bitrate,
     "-maxrate", variant.maxrate,
@@ -104,12 +107,21 @@ function runVariant(inputUrl, outputDirectory, variant, hasAudio, progressStart,
 async function runFfmpeg(inputUrl, outputDirectory, job) {
   const hasAudio = await inputHasAudio(inputUrl);
   const variants = [
-    { name: "360p", height: 360, bitrate: "650k", maxrate: "750k", bufsize: "1100k", audioBitrate: "96k" },
-    { name: "720p", height: 720, bitrate: "1900k", maxrate: "2200k", bufsize: "3300k", audioBitrate: "128k" },
+    { name: "360p", height: 360, bitrate: "850k", maxrate: "950k", bufsize: "1400k", audioBitrate: "96k", bandwidth: 1050000, averageBandwidth: 950000, resolution: "640x360" },
+    { name: "720p", height: 720, bitrate: "2300k", maxrate: "2600k", bufsize: "3900k", audioBitrate: "128k", bandwidth: 2800000, averageBandwidth: 2450000, resolution: "1280x720" },
   ];
+  const completedVariants = [];
 
   for (const [index, variant] of variants.entries()) {
-    await runVariant(inputUrl, outputDirectory, variant, hasAudio, index * 47, 47, job);
+    try {
+      await runVariant(inputUrl, outputDirectory, variant, hasAudio, index === 0 ? 0 : 70, index === 0 ? 70 : 24, job);
+      completedVariants.push(variant);
+    } catch (error) {
+      if (index === 0) throw error;
+      job.warning = `La calidad 720p no pudo generarse: ${error instanceof Error ? error.message : "error desconocido"}`;
+      console.warn(job.warning);
+      await rm(join(outputDirectory, variant.name), { recursive: true, force: true });
+    }
   }
 
   const codecs = hasAudio ? 'CODECS="avc1.64001e,mp4a.40.2"' : 'CODECS="avc1.64001e"';
@@ -117,10 +129,10 @@ async function runFfmpeg(inputUrl, outputDirectory, job) {
     "#EXTM3U",
     "#EXT-X-VERSION:3",
     "#EXT-X-INDEPENDENT-SEGMENTS",
-    `#EXT-X-STREAM-INF:BANDWIDTH=850000,AVERAGE-BANDWIDTH=750000,RESOLUTION=640x360,${codecs}`,
-    "360p/index.m3u8",
-    `#EXT-X-STREAM-INF:BANDWIDTH=2400000,AVERAGE-BANDWIDTH=2050000,RESOLUTION=1280x720,${codecs}`,
-    "720p/index.m3u8",
+    ...completedVariants.flatMap((variant) => [
+      `#EXT-X-STREAM-INF:BANDWIDTH=${variant.bandwidth},AVERAGE-BANDWIDTH=${variant.averageBandwidth},RESOLUTION=${variant.resolution},${codecs}`,
+      `${variant.name}/index.m3u8`,
+    ]),
     "",
   ].join("\n");
   await writeFile(join(outputDirectory, "master.m3u8"), master, "utf8");
