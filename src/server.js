@@ -15,7 +15,26 @@ import { bucket, s3 } from "./s3.js";
 const app = express();
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 
-app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
+function getAllowedOrigins() {
+  const raw = process.env.CORS_ORIGINS || process.env.FRONTEND_URL || "http://localhost:3000";
+  return raw
+    .trim()
+    .replace(/^\[/, "")
+    .replace(/\]$/, "")
+    .split(",")
+    .map((origin) => origin.trim().replace(/^['"]|['"]$/g, ""))
+    .filter(Boolean);
+}
+
+const allowedOrigins = getAllowedOrigins();
+
+app.use(cors({
+  credentials: true,
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error("Origen no permitido por CORS."));
+  },
+}));
 app.use(express.json({ limit: "2mb" }));
 app.use(cookieParser());
 

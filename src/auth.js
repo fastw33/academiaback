@@ -2,7 +2,11 @@ import { jwtVerify, SignJWT } from "jose";
 import { User } from "./models.js";
 
 const cookieName = "curso_session";
-const secret = () => new TextEncoder().encode(process.env.AUTH_SECRET);
+const secret = () => {
+  const value = process.env.JWT_SECRET || process.env.AUTH_SECRET;
+  if (!value || value.length < 32) throw new Error("JWT_SECRET debe tener al menos 32 caracteres.");
+  return new TextEncoder().encode(value);
+};
 
 export async function createSessionToken(user) {
   return new SignJWT({ email: user.email, role: user.role, name: user.name })

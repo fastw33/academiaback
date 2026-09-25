@@ -44,5 +44,7 @@ export const User = mongoose.models.User || mongoose.model("User", userSchema);
 
 export async function connectDB() {
   if (mongoose.connection.readyState === 1) return;
-  await mongoose.connect(process.env.MONGODB_URI);
+  const uri = process.env.MONGO_URI || process.env.MONGODB_URI;
+  if (!uri) throw new Error("MONGO_URI es obligatoria.");
+  await mongoose.connect(uri);
 }
