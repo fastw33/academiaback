@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { createServer, IncomingMessage } from "node:http";
+import { PassThrough } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import express from "express";
 import cors from "cors";
@@ -14,6 +16,30 @@ import { bucket, s3 } from "./s3.js";
 
 const app = express();
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+const clientDisconnectCodes = new Set(["ABORT_ERR", "ECONNRESET", "ERR_STREAM_PREMATURE_CLOSE", "HPE_INVALID_EOF_STATE"]);
+
+function isClientDisconnect(error, req) {
+  return req?.aborted || error?.name === "AbortError" || clientDisconnectCodes.has(error?.code);
+}
+
+function observeRequestErrors(req) {
+  req.on("error", (error) => {
+    if (!isClientDisconnect(error, req)) console.error("Request stream error:", error);
+  });
+}
+
+function observeTransferErrors(stream, req, label) {
+  stream.on("error", (error) => {
+    if (!isClientDisconnect(error, req)) console.error(`${label} stream error:`, error);
+  });
+}
+
+class SafeIncomingMessage extends IncomingMessage {
+  constructor(socket) {
+    super(socket);
+    observeRequestErrors(this);
+  }
+}
 
 function getAllowedOrigins() {
   const raw = process.env.CORS_ORIGINS || process.env.FRONTEND_URL || "http://localhost:3000";
@@ -27,6 +53,11 @@ function getAllowedOrigins() {
 }
 
 const allowedOrigins = getAllowedOrigins();
+
+app.use((req, _res, next) => {
+  if (req.listenerCount("error") === 0) observeRequestErrors(req);
+  next();
+});
 
 app.use(cors({
   credentials: true,
@@ -130,10 +161,11 @@ app.get("/api/video/stream", requireUser, asyncRoute(async (req, res) => {
   if (object.ContentLength !== undefined) res.setHeader("Content-Length", String(object.ContentLength));
   if (object.ContentRange) res.setHeader("Content-Range", object.ContentRange);
   if (!object.Body || typeof object.Body.pipe !== "function") throw new Error("MinIO no devolvió un stream de video.");
+  observeTransferErrors(object.Body, req, "Video");
   try {
     await pipeline(object.Body, res);
   } catch (error) {
-    if (!["ERR_STREAM_PREMATURE_CLOSE", "ECONNRESET"].includes(error?.code)) throw error;
+    if (!isClientDisconnect(error, req)) throw error;
   }
 }));
 
@@ -233,14 +265,54 @@ app.put("/api/admin/upload", requireUser, requireAdmin, asyncRoute(async (req, r
   if (!Number.isFinite(contentLength) || contentLength <= 0) return res.status(411).json({ error: "No se recibió el tamaño del video." });
   if (contentLength > maxBytes) return res.status(413).json({ error: `El video supera el máximo de ${process.env.MAX_VIDEO_SIZE_MB || 2048} MB.` });
 
-  await s3.send(new PutObjectCommand({
+  const abortController = new AbortController();
+  const uploadBody = new PassThrough();
+  observeTransferErrors(uploadBody, req, "Upload");
+  let resolveInput;
+  let rejectInput;
+  const inputPromise = new Promise((resolve, reject) => {
+    resolveInput = resolve;
+    rejectInput = reject;
+  });
+  const finishInput = () => resolveInput();
+  const failInput = (error) => {
+    abortController.abort();
+    uploadBody.destroy();
+    rejectInput(error);
+  };
+  const abortUpload = () => {
+    const error = new Error("La subida fue cancelada por el cliente.");
+    error.code = "ECONNRESET";
+    failInput(error);
+  };
+
+  req.once("end", finishInput);
+  req.once("aborted", abortUpload);
+  req.once("error", failInput);
+
+  const storagePromise = s3.send(new PutObjectCommand({
     Bucket: bucket,
     Key: key,
-    Body: req,
+    Body: uploadBody,
     ContentLength: contentLength,
     ContentType: contentType,
-  }));
-  res.status(201).json({ ok: true, key });
+  }), { abortSignal: abortController.signal }).catch((error) => {
+    failInput(error);
+    throw error;
+  });
+  req.pipe(uploadBody);
+
+  try {
+    const results = await Promise.allSettled([inputPromise, storagePromise]);
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed && !isClientDisconnect(failed.reason, req)) throw failed.reason;
+    if (!req.aborted && !res.destroyed) res.status(201).json({ ok: true, key });
+  } finally {
+    req.unpipe(uploadBody);
+    req.off("end", finishInput);
+    req.off("aborted", abortUpload);
+    req.off("error", failInput);
+  }
 }));
 
 const createUserSchema = z.object({
@@ -300,7 +372,11 @@ app.patch("/api/admin/users/:id", requireUser, requireAdmin, asyncRoute(async (r
   res.json({ user: serializeUser(user) });
 }));
 
-app.use((error, _req, res, _next) => {
+app.use((error, req, res, _next) => {
+  if (isClientDisconnect(error, req)) {
+    if (!res.destroyed) res.destroy();
+    return;
+  }
   console.error(error);
   if (res.headersSent) return res.destroy();
   res.status(500).json({ error: "Error interno del servidor." });
@@ -308,4 +384,9 @@ app.use((error, _req, res, _next) => {
 
 await connectDB();
 const port = Number(process.env.PORT || 4100);
-app.listen(port, () => console.log(`Fastway backend ready at http://localhost:${port}`));
+const server = createServer({ IncomingMessage: SafeIncomingMessage }, app);
+server.on("clientError", (error, socket) => {
+  if (!isClientDisconnect(error)) console.error("HTTP client error:", error);
+  socket.destroy();
+});
+server.listen(port, () => console.log(`Fastway backend ready at http://localhost:${port}`));
