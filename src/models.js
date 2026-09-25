@@ -12,7 +12,7 @@ const quizQuestionSchema = new mongoose.Schema(
 
 const quizSchema = new mongoose.Schema(
   {
-    passingScore: { type: Number, default: 90, min: 90, max: 100 },
+    passingScore: { type: Number, default: 70, min: 1, max: 100 },
     questions: { type: [quizQuestionSchema], default: [] },
   },
   { _id: false }

@@ -9,7 +9,7 @@ export function getCourseVideos(course) {
         durationLabel: video.durationLabel || "",
         order: video.order,
         quiz: video.quiz?.questions?.length ? {
-          passingScore: video.quiz.passingScore || 90,
+          passingScore: video.quiz.passingScore ?? 70,
           questions: video.quiz.questions.map((question) => ({
             id: question.id,
             prompt: question.prompt,

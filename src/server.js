@@ -459,7 +459,7 @@ const videoSchema = z.object({
   s3Key: z.string().min(3),
   durationLabel: z.string().optional().default(""),
   quiz: z.object({
-    passingScore: z.number().int().min(90).max(100).default(90),
+    passingScore: z.number().int().min(1).max(100).default(70),
     questions: z.array(quizQuestionSchema).min(5).max(6),
   }).nullable().optional().default(null),
 });
