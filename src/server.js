@@ -10,11 +10,12 @@ import { isValidObjectId } from "mongoose";
 import { z } from "zod";
 import { DeleteObjectsCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { connectDB, Course, User } from "./models.js";
-import { clearSessionCookie, createSessionToken, requireAdmin, requireUser, serializeUser, setSessionCookie } from "./auth.js";
+import { clearSessionCookie, createSessionToken, createUploadToken, requireAdmin, requireUploadToken, requireUser, serializeUser, setSessionCookie } from "./auth.js";
 import { getAccessWindow, getCourseVideos, isVideoUnlocked } from "./course-videos.js";
 import { bucket, s3 } from "./s3.js";
 
 const app = express();
+app.set("trust proxy", 1);
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 const clientDisconnectCodes = new Set(["ABORT_ERR", "ECONNRESET", "ERR_STREAM_PREMATURE_CLOSE", "HPE_INVALID_EOF_STATE"]);
 
@@ -249,18 +250,21 @@ app.post("/api/admin/upload-url", requireUser, requireAdmin, asyncRoute(async (r
   const id = randomUUID();
   const prefix = (process.env.S3_VIDEO_PREFIX || "courses").replace(/^\/+|\/+$/g, "");
   const key = `${prefix}/${new Date().toISOString().slice(0, 10)}/${id}${extension}`;
-  const url = `/api/admin/upload?key=${encodeURIComponent(key)}`;
-  res.json({ url, key, id });
+  const configuredApiUrl = (process.env.PUBLIC_API_URL || "").trim().replace(/\/+$/, "");
+  const apiUrl = configuredApiUrl || `${req.protocol}://${req.get("host")}`;
+  const url = `${apiUrl}/api/admin/upload?key=${encodeURIComponent(key)}`;
+  const token = await createUploadToken(key);
+  res.json({ url, token, key, id });
 }));
 
-app.put("/api/admin/upload", requireUser, requireAdmin, asyncRoute(async (req, res) => {
+app.put("/api/admin/upload", requireUploadToken, asyncRoute(async (req, res) => {
   const key = typeof req.query.key === "string" ? req.query.key : "";
   const prefix = `${(process.env.S3_VIDEO_PREFIX || "courses").replace(/^\/+|\/+$/g, "")}/`;
   const contentType = req.headers["content-type"] || "video/mp4";
   const contentLength = Number(req.headers["content-length"]);
   const maxBytes = Number(process.env.MAX_VIDEO_SIZE_MB || 2048) * 1024 * 1024;
 
-  if (!key.startsWith(prefix)) return res.status(400).json({ error: "Ruta de video inválida." });
+  if (!key.startsWith(prefix) || req.uploadKey !== key) return res.status(403).json({ error: "Ruta de video no autorizada." });
   if (!contentType.startsWith("video/")) return res.status(415).json({ error: "El archivo debe ser un video." });
   if (!Number.isFinite(contentLength) || contentLength <= 0) return res.status(411).json({ error: "No se recibió el tamaño del video." });
   if (contentLength > maxBytes) return res.status(413).json({ error: `El video supera el máximo de ${process.env.MAX_VIDEO_SIZE_MB || 2048} MB.` });

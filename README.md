@@ -32,3 +32,7 @@ npm start
 ```
 
 `S3_ENDPOINT` puede apuntar a MinIO u otro proveedor compatible con S3.
+`PUBLIC_API_URL` debe ser la URL publica del backend, por ejemplo
+`https://backacademy.fastwaysas.com`. Los videos se cargan directamente a esa
+URL con un token temporal para evitar que Next.js almacene archivos grandes en
+memoria. Incluye la URL del frontend en `CORS_ORIGINS`.
