@@ -36,6 +36,17 @@ const quizAttemptSchema = new mongoose.Schema(
     videoId: { type: String, required: true },
     score: { type: Number, required: true, min: 0, max: 100 },
     passed: { type: Boolean, required: true },
+    correct: { type: Number, default: 0, min: 0 },
+    total: { type: Number, default: 0, min: 0 },
+    answers: {
+      type: [{
+        questionId: { type: String, required: true },
+        optionIndex: { type: Number, required: true, min: 0, max: 3 },
+        isCorrect: { type: Boolean, required: true },
+        _id: false,
+      }],
+      default: [],
+    },
     attemptedAt: { type: Date, default: Date.now },
   },
   { _id: false }

@@ -12,7 +12,7 @@ import { z } from "zod";
 import { DeleteObjectsCommand, GetObjectCommand, ListObjectsV2Command, PutObjectCommand } from "@aws-sdk/client-s3";
 import { connectDB, Course, User } from "./models.js";
 import { clearSessionCookie, createPlaybackToken, createSessionToken, createUploadToken, requireAdmin, requirePlaybackToken, requireUploadToken, requireUser, serializeUser, setSessionCookie } from "./auth.js";
-import { getAccessWindow, getCourseVideos, isVideoUnlocked } from "./course-videos.js";
+import { getAccessWindow, getCourseVideos, getValidatedCompletedVideoIds, isVideoUnlocked } from "./course-videos.js";
 import { bucket, s3 } from "./s3.js";
 import { enqueueVideoOptimization, getVideoOptimization } from "./video-processing.js";
 
@@ -111,25 +111,51 @@ app.post("/api/auth/logout", (_req, res) => {
 
 app.get("/api/auth/me", requireUser, (req, res) => res.json({ user: serializeUser(req.user) }));
 
+function getLatestQuizAttempt(user, videoId) {
+  const attempt = [...(user.quizAttempts || [])].reverse().find((item) => item.videoId === videoId);
+  if (!attempt) return null;
+  return {
+    score: attempt.score,
+    passed: attempt.passed,
+    correct: attempt.correct || 0,
+    total: attempt.total || 0,
+    attemptedAt: attempt.attemptedAt || null,
+    answers: (attempt.answers || []).map((answer) => ({
+      questionId: answer.questionId,
+      optionIndex: answer.optionIndex,
+      isCorrect: answer.isCorrect,
+    })),
+  };
+}
+
 app.get("/api/course", requireUser, asyncRoute(async (req, res) => {
   const course = await Course.findOne({ slug: "principal", active: true }).lean();
   const videos = course ? getCourseVideos(course) : [];
+  const completedVideoIds = getValidatedCompletedVideoIds(videos, req.user);
+  const watchedVideoIds = [...new Set([
+    ...(req.user.watchedVideoIds || []),
+    ...(req.user.completedVideoIds || []),
+  ])];
   res.json({
     user: serializeUser(req.user),
     course: course ? {
       title: course.title,
       description: course.description,
-      videos: videos.map(({ s3Key: _s3Key, quiz, ...video }) => ({
-        ...video,
-        quiz: quiz ? {
-          passingScore: quiz.passingScore,
-          questions: quiz.questions.map(({ correctOptionIndex: _correctOptionIndex, ...question }) => question),
-        } : null,
-      })),
+      videos: videos.map(({ s3Key: _s3Key, quiz, ...video }) => {
+        const latestAttempt = getLatestQuizAttempt(req.user, video.id);
+        return {
+          ...video,
+          quiz: quiz ? {
+            passingScore: quiz.passingScore,
+            questions: quiz.questions.map(({ correctOptionIndex: _correctOptionIndex, ...question }) => question),
+            lastAttempt: latestAttempt ? { ...latestAttempt, passingScore: quiz.passingScore } : null,
+          } : null,
+        };
+      }),
     } : null,
     access: getAccessWindow(req.user),
-    completedVideoIds: req.user.completedVideoIds || [],
-    watchedVideoIds: req.user.watchedVideoIds || [],
+    completedVideoIds,
+    watchedVideoIds,
   });
 }));
 
@@ -155,7 +181,8 @@ async function getAuthorizedVideo(req, res) {
     res.status(403).json({ error: "Tu acceso al video está bloqueado." });
     return null;
   }
-  if (req.user.role !== "admin" && !isVideoUnlocked(videos, video.id, req.user.completedVideoIds || [])) {
+  const completed = getValidatedCompletedVideoIds(videos, req.user);
+  if (req.user.role !== "admin" && !isVideoUnlocked(videos, video.id, completed)) {
     res.status(403).json({ error: "Completa las lecciones anteriores para continuar." });
     return null;
   }
@@ -246,13 +273,14 @@ app.post("/api/video/progress", requireUser, asyncRoute(async (req, res) => {
   const videos = getCourseVideos(course);
   const video = videos.find((item) => item.id === parsed.data.videoId);
   if (!video) return res.status(404).json({ error: "La lección no existe." });
-  const completed = req.user.completedVideoIds || [];
+  const completed = getValidatedCompletedVideoIds(videos, req.user);
   if (req.user.role !== "admin" && !isVideoUnlocked(videos, video.id, completed)) {
     return res.status(403).json({ error: "Completa las lecciones anteriores para continuar." });
   }
   const watched = req.user.watchedVideoIds || [];
   if (!watched.includes(video.id)) req.user.watchedVideoIds = [...watched, video.id];
   if (video.quiz?.questions?.length) {
+    req.user.completedVideoIds = completed;
     await req.user.save();
     return res.json({ completedVideoIds: completed, requiresQuiz: true });
   }
@@ -284,29 +312,49 @@ app.post("/api/video/quiz", requireUser, asyncRoute(async (req, res) => {
   if (!video?.quiz || video.quiz.questions.length < 5) {
     return res.status(404).json({ error: "Esta lección no tiene evaluación." });
   }
-  const completed = req.user.completedVideoIds || [];
+  const storedCompleted = req.user.completedVideoIds || [];
+  const completed = getValidatedCompletedVideoIds(videos, req.user);
+  const passedPreviously = (req.user.quizAttempts || []).some(
+    (attempt) => attempt.videoId === video.id && attempt.passed
+  );
   if (req.user.role !== "admin" && !isVideoUnlocked(videos, video.id, completed)) {
     return res.status(403).json({ error: "Completa las lecciones anteriores para continuar." });
   }
-  if (req.user.role !== "admin" && !(req.user.watchedVideoIds || []).includes(video.id)) {
+  const previouslyCompleted = storedCompleted.includes(video.id);
+  if (req.user.role !== "admin" && !(req.user.watchedVideoIds || []).includes(video.id) && !previouslyCompleted) {
     return res.status(403).json({ error: "Debes finalizar el video antes de presentar la evaluación." });
+  }
+  if (previouslyCompleted && !(req.user.watchedVideoIds || []).includes(video.id)) {
+    req.user.watchedVideoIds = [...(req.user.watchedVideoIds || []), video.id];
   }
 
   const answers = new Map(parsed.data.answers.map((answer) => [answer.questionId, answer.optionIndex]));
   if (answers.size !== video.quiz.questions.length || video.quiz.questions.some((question) => !answers.has(question.id))) {
     return res.status(400).json({ error: "Responde todas las preguntas antes de calificar." });
   }
-  const correct = video.quiz.questions.reduce(
-    (total, question) => total + (answers.get(question.id) === question.correctOptionIndex ? 1 : 0),
-    0
-  );
+  const answerResults = video.quiz.questions.map((question) => ({
+    questionId: question.id,
+    optionIndex: answers.get(question.id),
+    isCorrect: answers.get(question.id) === question.correctOptionIndex,
+  }));
+  const correct = answerResults.filter((answer) => answer.isCorrect).length;
   const score = Math.round((correct / video.quiz.questions.length) * 100);
   const passed = score >= video.quiz.passingScore;
   req.user.quizAttempts = [
     ...(req.user.quizAttempts || []).slice(-99),
-    { videoId: video.id, score, passed, attemptedAt: new Date() },
+    {
+      videoId: video.id,
+      score,
+      passed,
+      correct,
+      total: video.quiz.questions.length,
+      answers: answerResults,
+      attemptedAt: new Date(),
+    },
   ];
-  if (passed && !completed.includes(video.id)) req.user.completedVideoIds = [...completed, video.id];
+  req.user.completedVideoIds = (passed || passedPreviously)
+    ? [...new Set([...completed, video.id])]
+    : completed.filter((videoId) => videoId !== video.id);
   await req.user.save();
 
   res.json({
@@ -315,7 +363,8 @@ app.post("/api/video/quiz", requireUser, asyncRoute(async (req, res) => {
     correct,
     total: video.quiz.questions.length,
     passingScore: video.quiz.passingScore,
-    completedVideoIds: req.user.completedVideoIds || [],
+    answers: answerResults,
+    completedVideoIds: getValidatedCompletedVideoIds(videos, req.user),
   });
 }));
 

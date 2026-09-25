@@ -37,6 +37,16 @@ export function isVideoUnlocked(videos, videoId, completedIds) {
   return index >= 0 && videos.slice(0, index).every((video) => completedIds.includes(video.id));
 }
 
+export function getValidatedCompletedVideoIds(videos, user) {
+  const passedQuizIds = new Set(
+    (user.quizAttempts || []).filter((attempt) => attempt.passed).map((attempt) => attempt.videoId)
+  );
+  return (user.completedVideoIds || []).filter((videoId) => {
+    const video = videos.find((item) => item.id === videoId);
+    return !video?.quiz?.questions?.length || passedQuizIds.has(videoId);
+  });
+}
+
 export function getAccessWindow(user) {
   const durationDays = user.accessDurationDays || Number(process.env.DEFAULT_ACCESS_DAYS || 20);
   const startsAt = user.accessStartsAt ? new Date(user.accessStartsAt) : null;
